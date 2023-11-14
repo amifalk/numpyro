@@ -10,6 +10,7 @@ from numpyro.infer.elbo import (
     TraceGraph_ELBO,
     TraceMeanField_ELBO,
 )
+from numpyro.infer.ensemble_sampler import EnsembleSampler
 from numpyro.infer.hmc import HMC, NUTS
 from numpyro.infer.hmc_gibbs import HMCECS, DiscreteHMCGibbs, HMCGibbs
 from numpyro.infer.initialization import (
@@ -41,6 +42,7 @@ __all__ = [
     "BarkerMH",
     "DiscreteHMCGibbs",
     "ELBO",
+    "EnsembleSampler"
     "HMC",
     "HMCECS",
     "HMCGibbs",
