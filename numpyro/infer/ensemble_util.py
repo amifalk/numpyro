@@ -12,6 +12,22 @@ from jax._src.util import safe_zip, unzip2, HashablePartial
 zip = safe_zip
 
 
+def _get_nondiagonal_pairs(n):
+    """
+    From https://github.com/dfm/emcee/blob/main/src/emcee/moves/de.py:
+    
+    Get the indices of a square matrix with size n, excluding the diagonal.
+    """
+    
+    rows, cols = np.tril_indices(n, -1)  # -1 to exclude diagonal
+
+    # Combine rows-cols and cols-rows pairs
+    pairs = np.column_stack([np.concatenate([rows, cols]), 
+                             np.concatenate([cols, rows])])
+
+    return jnp.asarray(pairs)
+
+
 def batch_ravel_pytree(pytree):
     """Ravel (flatten) a pytree of arrays with leading batch dimension down to a (batch_size, 1D) array.   
     Args:

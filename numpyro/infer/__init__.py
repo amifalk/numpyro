@@ -10,7 +10,7 @@ from numpyro.infer.elbo import (
     TraceGraph_ELBO,
     TraceMeanField_ELBO,
 )
-from numpyro.infer.ensemble_sampler import EnsembleSampler
+from numpyro.infer.ensemble import AIES, ESS
 from numpyro.infer.hmc import HMC, NUTS
 from numpyro.infer.hmc_gibbs import HMCECS, DiscreteHMCGibbs, HMCGibbs
 from numpyro.infer.initialization import (
@@ -30,6 +30,7 @@ from numpyro.infer.util import Predictive, log_likelihood
 from . import autoguide, reparam
 
 __all__ = [
+    "AIES",
     "autoguide",
     "init_to_feasible",
     "init_to_mean",
@@ -42,7 +43,7 @@ __all__ = [
     "BarkerMH",
     "DiscreteHMCGibbs",
     "ELBO",
-    "EnsembleSampler"
+    "ESS",
     "HMC",
     "HMCECS",
     "HMCGibbs",
