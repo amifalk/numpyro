@@ -315,10 +315,9 @@ class EnsembleSampler(MCMCKernel, ABC):
 
 # affine-invariant ensemble sampler
 class AIES(EnsembleSampler):
-    # TODO: this doesn't work because state_method='vectorized' shuts off diagnostics_str
-    def get_diagnostics_str(self, inner_state):
-        return "acc. prob={:.2f}".format(inner_state.mean_accept_prob)
-    
+    # TODO: this doesn't show because state_method='vectorized' shuts off diagnostics_str
+    def get_diagnostics_str(self, state):
+        return "acc. prob={:.2f}".format(state.inner_state.mean_accept_prob)
     
     def init_inner_state(self, rng_key):
         # TODO: allow users to specify moves and their corresponding probs
@@ -329,7 +328,7 @@ class AIES(EnsembleSampler):
         # ]
 
         self.moves = [AIES.StretchMove, 
-                      AIES.make_de_move(self._num_chains)
+                      AIES.make_de_move(self._num_chains) # TODO: broken for constrained params
                       ]
 
         return AIESState(jnp.array(0.), 
@@ -341,7 +340,7 @@ class AIES(EnsembleSampler):
         i, _, mean_accept_prob, rng_key = inner_state
         rng_key, move_key, proposal_key, accept_key = random.split(rng_key, 4)
 
-        move_i = random.choice(move_key, len(self.moves), p=jnp.array([0., 1.]))
+        move_i = random.choice(move_key, len(self.moves), p=jnp.array([1., 0.]))
         proposal, factors = jax.lax.switch(move_i, self.moves, proposal_key, active, inactive)         
             
         # --- evaluate the proposal ---                
@@ -388,7 +387,7 @@ class AIES(EnsembleSampler):
     def make_de_move(n_chains):
         PAIRS = _get_nondiagonal_pairs(n_chains // 2)
 
-        # TODO: this is broken
+        # TODO: this breaks with constrained params for some reason
         def DEMove(rng_key, active, inactive, sigma=1.0e-5, g0=None):
             """A proposal using differential evolution.
             This `Differential evolution proposal
