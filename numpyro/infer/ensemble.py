@@ -2,12 +2,13 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 
 import jax
+from jax.scipy.stats import gaussian_kde
 from numpyro.infer.ensemble_util import batch_ravel_pytree, _get_nondiagonal_pairs
 from jax import random, vmap
 import jax.numpy as jnp
 
 import numpyro.distributions as dist
-from numpyro.infer.initialization import init_to_uniform
+from numpyro.infer.initialization import init_to_uniform, init_to_sample
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import initialize_model
 from numpyro.util import identity, is_prng_key
@@ -312,7 +313,7 @@ class ESS(EnsembleSampler):
                  max_iter=10_000,
                  init_mu=1.0,
                  tune_mu=True,
-                 init_strategy=init_to_uniform):
+                 init_strategy=init_to_sample):
         
         self._max_steps = max_steps # max number of stepping out steps
         self._max_iter = max_iter # max number of expansions/contractions
@@ -325,6 +326,8 @@ class ESS(EnsembleSampler):
     def init_inner_state(self, rng_key):        
         self.batch_log_density = lambda x: self._batch_log_density(x)[:, jnp.newaxis] 
         
+        #self.move = ESS.make_differential_move(self._num_chains)
+        
         return ESSState(self._init_mu, rng_key)
 
 
@@ -334,6 +337,9 @@ class ESS(EnsembleSampler):
         n_active_chains, n_params = active.shape
         
         directions = ESS.RandomMove(dir_key, inactive, mu)
+        #self.move(dir_key, inactive, mu) #ESS.DifferentialMove(dir_key, inactive, mu)
+        #ESS.KDEMove(dir_key, inactive, mu)
+        ##
         
         log_slice_height = self.batch_log_density(active) - dist.Exponential().sample(height_key, 
                                                                                   sample_shape=(n_active_chains, 1))
@@ -351,25 +357,73 @@ class ESS(EnsembleSampler):
 
 
     @staticmethod
-    def RandomMove(rng_key, inactive, mu=1.0):
+    def RandomMove(rng_key, inactive, mu):
         """
-        Generate direction vectors.
-        Parameters
-        ----------
-            inactive: array
-                Array of shape ``(nwalkers//2, ndim)`` with the walker positions of the complementary ensemble.
-            mu : float
-                The value of the scale factor ``mu``.
-
-        Returns
-        -------
-            directions : array
-                Array of direction vectors of shape ``(nwalkers//2, ndim)``.
+        The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Random Move" with parallelization.
+        When this move is used the walkers move along random directions. There is no communication between the
+        walkers and this Move corresponds to the vanilla Slice Sampling method. This Move should be used for
+        debugging purposes only.
         """
         directions = dist.Normal(loc=0, scale=1).sample(rng_key, sample_shape=inactive.shape)
         directions /= jnp.linalg.norm(directions, axis=0)
     
         return 2.0 * mu * directions
+
+
+    # TODO: this move needs burn-in first before it can be used
+    @staticmethod
+    def KDEMove(bw_method=None):
+        def _KDEMove(rng_key, inactive, mu):
+            """
+            The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "KDE Move" with parallelization.
+            When this Move is used the distribution of the walkers of the complementary ensemble is traced using
+            a Gaussian Kernel Density Estimation methods. The walkers then move along random direction vectos
+            sampled from this distribution.
+            """
+            n_active_chains, n_params = inactive.shape
+
+            kde = gaussian_kde(inactive.T, bw_method=bw_method)
+
+            vectors = kde.resample(rng_key, (2 * n_active_chains,)).T
+            directions = vectors[:n_active_chains] - vectors[n_active_chains:]
+
+            return 2.0 * mu * directions
+
+        return _KDEMove
+
+    # TODO: this move needs burn-in first before it can be used
+    @staticmethod
+    def GaussianMove(rng_key, inactive, mu):
+        """
+        The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Gaussian Move" with parallelization.
+        When this Move is used the walkers move along directions defined by random vectors sampled from the Gaussian
+        approximation of the walkers of the complementary ensemble.
+        """
+        n_active_chains, n_params = inactive.shape        
+        cov = jnp.cov(inactive, rowvar=False)
+
+        return 2.0 * mu * dist.MultivariateNormal(0, cov).sample(rng_key, sample_shape=(n_active_chains,))
+
+
+    @staticmethod
+    def make_differential_move(n_chains):
+        PAIRS = _get_nondiagonal_pairs(n_chains // 2)
+        
+        def DifferentialMove(rng_key, inactive, mu):
+            """
+            The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Differential Move" with parallelization.
+            When this Move is used the walkers move along directions defined by random pairs of walkers sampled (with no
+            replacement) from the complementary ensemble. This is the default choice and performs well along a wide range
+            of target distributions.
+            """
+            n_active_chains, n_params = inactive.shape
+            
+            selected_pairs = random.choice(rng_key, PAIRS, shape=(n_active_chains,))
+            diffs = jnp.diff(inactive[selected_pairs], axis=1).squeeze(axis=1) # get the pairwise difference of each vector
+
+            return 2.0 * mu * diffs
+
+        return DifferentialMove
 
 
     def _step_out(self, rng_key, log_slice_height, active, directions):
@@ -419,6 +473,7 @@ class ESS(EnsembleSampler):
         n_expansions, L, R, J, K, mask_J, mask_K, iteration = jax.lax.while_loop(cond_fn, body_fn, init_values)
 
         return n_expansions, L, R
+
 
     def _shrink(self, rng_key, log_slice_height, L, R, active, directions):
         n_active_chains, n_params = active.shape
