@@ -341,8 +341,7 @@ class AIES(EnsembleSampler):
         i, _, mean_accept_prob, rng_key = inner_state
         rng_key, move_key, proposal_key, accept_key = random.split(rng_key, 4)
 
-
-        move_i = random.choice(move_key, len(self.moves)) #,p=jnp.array([.3, .7, 0.]))
+        move_i = random.choice(move_key, len(self.moves), p=jnp.array([0., 1.]))
         proposal, factors = jax.lax.switch(move_i, self.moves, proposal_key, active, inactive)         
             
         # --- evaluate the proposal ---                
@@ -389,6 +388,7 @@ class AIES(EnsembleSampler):
     def make_de_move(n_chains):
         PAIRS = _get_nondiagonal_pairs(n_chains // 2)
 
+        # TODO: this is broken
         def DEMove(rng_key, active, inactive, sigma=1.0e-5, g0=None):
             """A proposal using differential evolution.
             This `Differential evolution proposal
@@ -420,7 +420,7 @@ class AIES(EnsembleSampler):
             # instead of the standard deviation of the distribution of the proposal as proposed by Ter Braak (2006).
             # Otherwise, sigma should be tuned for each dimension, which confronts the idea of affine-invariance.
 
-            proposal = inactive + gamma*diffs
+            proposal = inactive + gamma * diffs
 
             return proposal, jnp.zeros(n_active_chains)
 
