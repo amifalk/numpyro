@@ -52,6 +52,7 @@ A :func:`~collections.namedtuple` consisting of the following fields.
 ESSState = namedtuple(
     "ESSState", 
     [
+        "mu",
         "rng_key"
     ]
 )
@@ -59,136 +60,9 @@ ESSState = namedtuple(
 A :func:`~collections.namedtuple` used as an inner state for Ensemble Sampler.
 This consists of the following fields:
 
+ - **mu** - Scale factor. This is tuned if tune_mu=True.
  - **rng_key** - random number generator seed used for generating proposals, etc.
 """
-
-
-
-# ensemble slice sampler internal functions
-def _ess(batch_log_density):
-    # for easier batching
-    batch_log_density = lambda x: batch_log_density(x)[:, jnp.newaxis]    
-    
-    # TODO what are these again?
-    MAXSTEPS = 10_000
-    MAXITER = 10_000 
-    
-    def step_out(rng_key, log_slice_height, active, directions):
-        init_L_key, init_J_key = random.split(rng_key) 
-        n_active_chains, n_params = active.shape
-
-        iteration = 0
-        n_expansions = 0
-        # set initial interval boundaries
-        L = -dist.Uniform().sample(init_L_key, sample_shape=(n_active_chains, 1))     
-        R = L + 1.0    
-
-        # stepping out
-        J = jnp.floor(dist.Uniform(low=0, high=MAXSTEPS).sample(init_J_key, sample_shape=(n_active_chains, 1)))    
-        K = (MAXSTEPS - 1) - J
-        mask_J = jnp.full((n_active_chains, 1), True) # left stepping-out initialisation
-        mask_K = jnp.full((n_active_chains, 1), True) # right stepping-out initialisation
-
-        init_values = (n_expansions, L, R, J, K, mask_J, mask_K, iteration)
-
-        def cond_fn(args):
-            n_expansions, L, R, J, K, mask_J, mask_K, iteration = args
-
-            return (jnp.count_nonzero(mask_J) + jnp.count_nonzero(mask_K) > 0) & (iteration < MAXITER) 
-
-        def body_fn(args):
-            n_expansions, L, R, J, K, mask_J, mask_K, iteration = args
-
-            log_prob_L = batch_log_density(directions * L + active) # TODO: could make this into one if I wanted to
-            log_prob_R = batch_log_density(directions * R + active)
-
-            can_expand_L = log_prob_L > log_slice_height
-            L = jnp.where(can_expand_L, L - 1, L)
-            J = jnp.where(can_expand_L, J - 1, J)
-            mask_J = jnp.where(can_expand_L, mask_J, False)
-
-            can_expand_R = log_prob_R > log_slice_height
-            R = jnp.where(can_expand_R, R + 1, R) 
-            K = jnp.where(can_expand_R, K - 1, K) 
-            mask_K = jnp.where(can_expand_R, mask_K, False) 
-
-            iteration += 1
-            n_expansions += jnp.count_nonzero(can_expand_L) + jnp.count_nonzero(can_expand_R) 
-
-            return (n_expansions, L, R, J, K, mask_J, mask_K, iteration)
-
-        # returns (n_expansions, L, R)
-        n_expansions, L, R, J, K, mask_J, mask_K, iteration = jax.lax.while_loop(cond_fn, body_fn, init_values)
-
-        return n_expansions, L, R
-    
-    def shrink(rng_key, log_slice_height, L, R, active, directions):
-        n_active_chains, n_params = active.shape
-        
-        iteration = 0
-        n_contractions = 0
-        widths = jnp.zeros((n_active_chains, 1))
-        proposed = jnp.zeros((n_active_chains, n_params))
-        can_shrink = jnp.full((n_active_chains, 1), True) # this should be called can_shrink
-
-        init_values = (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration)
-
-        def cond_fn(args):
-            (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration) = args
-
-            return (jnp.count_nonzero(can_shrink) > 0) & (iteration < MAXITER) 
-
-        def body_fn(args):
-            rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration = args
-
-            rng_key, _ = random.split(rng_key)
-
-            widths = jnp.where(can_shrink, dist.Uniform(low=L, high=R).sample(rng_key), widths) 
-
-            # compute new positions
-            proposed = jnp.where(can_shrink, directions * widths + active, proposed)
-            proposed_log_prob = batch_log_density(proposed)
-
-            # shrink slices  
-            can_shrink = proposed_log_prob < log_slice_height
-
-            L_cond = can_shrink & (widths < 0.0)
-            L = jnp.where(L_cond, widths, L)
-
-            R_cond = can_shrink & (widths > 0.0)
-            R = jnp.where(R_cond, widths, R)
-
-            iteration += 1 
-            n_contractions += jnp.count_nonzero(L_cond) + jnp.count_nonzero(R_cond) 
-
-            return (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration)
-
-        rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration = jax.lax.while_loop(cond_fn, body_fn, init_values)
-        
-        return proposed, n_contractions 
-
-
-    def sample_kernel(rng_key, active, inactive):
-        n_active_chains, n_params = active.shape
-        rng_key, dir_key, height_key, step_out_key, shrink_key = random.split(rng_key, 5)
-        
-        mu = 1.0
-        
-        directions = ESS.RandomMove(dir_key, inactive, mu)
-        log_slice_height = batch_log_density(active) - dist.Exponential().sample(height_key, 
-                                                                                  sample_shape=(n_active_chains, 1))
-        
-        n_expansions, L, R = step_out(step_out_key, log_slice_height, active, directions)
-        proposal, n_contractions = shrink(shrink_key, log_slice_height, L, R, active, directions)
-
-        # TODO: add tuning
-        # this should be computed from the sum from both ones
-        # n_expansions = jnp.max(jnp.array([1, n_expansions])) # This is to prevent the optimizer from getting stuck
-        # mu *= 2.0 * n_expansions / (n_expansions + n_contractions)    
-
-        return proposal
-
-    return sample_kernel
 
 
 class EnsembleSampler(MCMCKernel, ABC):
@@ -340,7 +214,7 @@ class AIES(EnsembleSampler):
         i, _, mean_accept_prob, rng_key = inner_state
         rng_key, move_key, proposal_key, accept_key = random.split(rng_key, 4)
 
-        move_i = random.choice(move_key, len(self.moves), p=jnp.array([1., 0.]))
+        move_i = random.choice(move_key, len(self.moves), p=jnp.array([0., 1.]))
         proposal, factors = jax.lax.switch(move_i, self.moves, proposal_key, active, inactive)         
             
         # --- evaluate the proposal ---                
@@ -425,17 +299,55 @@ class AIES(EnsembleSampler):
 
         return DEMove
         
+        
+        
     
 # ensemble slice sampler    
 class ESS(EnsembleSampler):
-    def init_inner_state(self, rng_key):
-        # TODO
-        pass
+    def __init__(self, 
+                 model=None,
+                 potential_fn=None,
+                 randomize_split=True,
+                 max_steps=10_000,
+                 max_iter=10_000,
+                 init_mu=1.0,
+                 tune_mu=True,
+                 init_strategy=init_to_uniform):
+        
+        self._max_steps = max_steps # max number of stepping out steps
+        self._max_iter = max_iter # max number of expansions/contractions
+        self._init_mu = init_mu
+        self._tune_mu = tune_mu
+        
+        super().__init__(model, potential_fn, randomize_split, init_strategy)
+        
+    
+    def init_inner_state(self, rng_key):        
+        self.batch_log_density = lambda x: self._batch_log_density(x)[:, jnp.newaxis] 
+        
+        return ESSState(self._init_mu, rng_key)
 
 
     def update_active_chains(self, active, inactive, inner_state):
-        # TODO
-        pass
+        mu, rng_key = inner_state
+        rng_key, dir_key, height_key, step_out_key, shrink_key = random.split(rng_key, 5)
+        n_active_chains, n_params = active.shape
+        
+        directions = ESS.RandomMove(dir_key, inactive, mu)
+        
+        log_slice_height = self.batch_log_density(active) - dist.Exponential().sample(height_key, 
+                                                                                  sample_shape=(n_active_chains, 1))
+        
+        n_expansions, L, R = self._step_out(step_out_key, log_slice_height, active, directions)
+        proposal, n_contractions = self._shrink(shrink_key, log_slice_height, L, R, active, directions)
+
+        # TODO: this should be computed from the sum of both chain sets
+        if self._tune_mu:
+            n_expansions = jnp.max(jnp.array([1, n_expansions])) # This is to prevent the optimizer from getting stuck
+            mu = 2.0 * n_expansions / (n_expansions + n_contractions)
+            
+
+        return proposal, ESSState(mu, rng_key)
 
 
     @staticmethod
@@ -458,3 +370,97 @@ class ESS(EnsembleSampler):
         directions /= jnp.linalg.norm(directions, axis=0)
     
         return 2.0 * mu * directions
+
+
+    def _step_out(self, rng_key, log_slice_height, active, directions):
+        init_L_key, init_J_key = random.split(rng_key) 
+        n_active_chains, n_params = active.shape
+
+        iteration = 0
+        n_expansions = 0
+        # set initial interval boundaries
+        L = -dist.Uniform().sample(init_L_key, sample_shape=(n_active_chains, 1))     
+        R = L + 1.0    
+
+        # stepping out
+        J = jnp.floor(dist.Uniform(low=0, high=self._max_steps).sample(init_J_key, sample_shape=(n_active_chains, 1)))    
+        K = (self._max_steps - 1) - J
+        mask_J = jnp.full((n_active_chains, 1), True) # left stepping-out initialisation
+        mask_K = jnp.full((n_active_chains, 1), True) # right stepping-out initialisation
+
+        init_values = (n_expansions, L, R, J, K, mask_J, mask_K, iteration)
+
+        def cond_fn(args):
+            n_expansions, L, R, J, K, mask_J, mask_K, iteration = args
+
+            return (jnp.count_nonzero(mask_J) + jnp.count_nonzero(mask_K) > 0) & (iteration < self._max_iter) 
+
+        def body_fn(args):
+            n_expansions, L, R, J, K, mask_J, mask_K, iteration = args
+
+            log_prob_L = self.batch_log_density(directions * L + active) # TODO: could make this into one if I wanted to
+            log_prob_R = self.batch_log_density(directions * R + active)
+
+            can_expand_L = log_prob_L > log_slice_height
+            L = jnp.where(can_expand_L, L - 1, L)
+            J = jnp.where(can_expand_L, J - 1, J)
+            mask_J = jnp.where(can_expand_L, mask_J, False)
+
+            can_expand_R = log_prob_R > log_slice_height
+            R = jnp.where(can_expand_R, R + 1, R) 
+            K = jnp.where(can_expand_R, K - 1, K) 
+            mask_K = jnp.where(can_expand_R, mask_K, False) 
+
+            iteration += 1
+            n_expansions += jnp.count_nonzero(can_expand_L) + jnp.count_nonzero(can_expand_R) 
+
+            return (n_expansions, L, R, J, K, mask_J, mask_K, iteration)
+
+        n_expansions, L, R, J, K, mask_J, mask_K, iteration = jax.lax.while_loop(cond_fn, body_fn, init_values)
+
+        return n_expansions, L, R
+
+    def _shrink(self, rng_key, log_slice_height, L, R, active, directions):
+        n_active_chains, n_params = active.shape
+        
+        iteration = 0
+        n_contractions = 0
+        widths = jnp.zeros((n_active_chains, 1))
+        proposed = jnp.zeros((n_active_chains, n_params))
+        can_shrink = jnp.full((n_active_chains, 1), True) # this should be called can_shrink
+
+        init_values = (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration)
+
+        def cond_fn(args):
+            (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration) = args
+
+            return (jnp.count_nonzero(can_shrink) > 0) & (iteration < self._max_iter) 
+
+        def body_fn(args):
+            rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration = args
+
+            rng_key, _ = random.split(rng_key)
+
+            widths = jnp.where(can_shrink, dist.Uniform(low=L, high=R).sample(rng_key), widths) 
+
+            # compute new positions
+            proposed = jnp.where(can_shrink, directions * widths + active, proposed)
+            proposed_log_prob = self.batch_log_density(proposed)
+
+            # shrink slices  
+            can_shrink = proposed_log_prob < log_slice_height
+
+            L_cond = can_shrink & (widths < 0.0)
+            L = jnp.where(L_cond, widths, L)
+
+            R_cond = can_shrink & (widths > 0.0)
+            R = jnp.where(R_cond, widths, R)
+
+            iteration += 1 
+            n_contractions += jnp.count_nonzero(L_cond) + jnp.count_nonzero(R_cond) 
+
+            return (rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration)
+
+        rng_key, proposed, n_contractions, L, R, widths, can_shrink, iteration = jax.lax.while_loop(cond_fn, body_fn, init_values)
+        
+        return proposed, n_contractions 
