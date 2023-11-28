@@ -37,11 +37,20 @@ A :func:`~collections.namedtuple` consisting of the following fields.
  - **rng_key** - random number generator seed used for generating proposals, etc.
 """
 
-ESSState = namedtuple("ESSState", ["mu", "rng_key"])
+ESSState = namedtuple("ESSState", ["i",
+                                   "n_expansions",
+                                   "n_contractions",
+                                   "mu",
+                                   "rng_key"
+                                   ]
+                      )
 """
 A :func:`~collections.namedtuple` used as an inner state for Ensemble Sampler.
 This consists of the following fields:
 
+ - **i** - iteration. This is reset to 0 after warmup.
+ - **n_expansions** - number of expansions in the last two batches. Used for tuning mu.
+ - **n_contractions** - number of contractions in the last two batches. Used for tuning mu.
  - **mu** - Scale factor. This is tuned if tune_mu=True.
  - **rng_key** - random number generator seed used for generating proposals, etc.
 """
@@ -54,9 +63,8 @@ class EnsembleSampler(MCMCKernel, ABC):
 
         self._model = model
         self._potential_fn = potential_fn
-        self._batch_log_density = (
-            None  # unravel an (n_chains, n_params) Array into a pytree and
-        )
+        self._batch_log_density = None
+        # unravel an (n_chains, n_params) Array into a pytree and
         # evaluate the log density at each chain
 
         # --- other hyperparams go here
@@ -174,98 +182,26 @@ class EnsembleSampler(MCMCKernel, ABC):
 
 
 class AIES(EnsembleSampler):
-    def StretchMove(rng_key, active, inactive, a=2.0):
-        """
-        A `Goodman & Weare (2010)
-        <https://msp.org/camcos/2010/5-1/p04.xhtml>`_ "stretch move" with
-        parallelization as described in `Foreman-Mackey et al. (2013)
-        <https://arxiv.org/abs/1202.3665>`_.
-
-        :param a: (optional)
-            The stretch scale parameter. (default: ``2.0``)
-        """
-        n_active_chains, n_params = active.shape
-        unif_key, idx_key = random.split(rng_key)
-
-        zz = (
-            (a - 1.0) * random.uniform(unif_key, shape=(n_active_chains,)) + 1
-        ) ** 2.0 / a
-        factors = (n_params - 1.0) * jnp.log(zz)
-        r_idxs = random.randint(
-            idx_key, shape=(n_active_chains,), minval=0, maxval=n_active_chains
-        )
-
-        proposal = inactive[r_idxs] - (inactive[r_idxs] - active) * zz[:, jnp.newaxis]
-
-        return proposal, factors
-
-    def make_de(n_chains):
-        PAIRS = _get_nondiagonal_pairs(n_chains // 2)
-
-        def DEMove(rng_key, active, inactive, sigma=1.0e-5, g0=None):
-            """A proposal using differential evolution.
-            This `Differential evolution proposal
-            <http://www.stat.columbia.edu/~gelman/stuff_for_blog/cajo.pdf>`_ is
-            implemented following `Nelson et al. (2013)
-            <https://doi.org/10.1088/0067-0049/210/1/11>`_.
-            Args:
-                sigma (float): The standard deviation of the Gaussian used to stretch
-                    the proposal vector.
-                gamma0 (Optional[float]): The mean stretch factor for the proposal
-                    vector. By default, it is `2.38 / sqrt(2*ndim)`
-                    as recommended by the two references.
-            """
-            pairs_key, gamma_key = random.split(rng_key)
-            n_active_chains, n_params = inactive.shape
-
-            if not g0:
-                g0 = 2.38 / jnp.sqrt(2.0 * n_params)
-
-            selected_pairs = random.choice(pairs_key, PAIRS, shape=(n_active_chains,))
-
-            # Compute diff vectors
-            diffs = jnp.diff(inactive[selected_pairs], axis=1).squeeze(
-                axis=1
-            )  # get the pairwise difference of each vector
-
-            # Sample a gamma value for each walker following Nelson et al. (2013)
-            gamma = dist.Normal(g0, g0 * sigma).sample(
-                gamma_key, sample_shape=(n_active_chains, 1)
-            )
-
-            # In this way, sigma is the standard deviation of the distribution of gamma,
-            # instead of the standard deviation of the distribution of the proposal as proposed by Ter Braak (2006).
-            # Otherwise, sigma should be tuned for each dimension, which confronts the idea of affine-invariance.
-            proposal = active + gamma * diffs
-
-            return proposal, jnp.zeros(n_active_chains)
-
-        return DEMove
-
-    _MOVES = {"DE": make_de, "Stretch": StretchMove}
-
+    """Affine-Invariant Ensemble Sampling as implemented in emcee"""
+    
     def __init__( self, model=None, potential_fn=None, randomize_split=False, init_strategy=init_to_uniform, moves=None):
         if not moves:
-            self._moves = [AIES._MOVES["DE"]]
+            self._moves = [AIES.DEMove()]
             self._weights = jnp.array([1.0])
         else:
-            self._moves = [AIES._MOVES[name] for name in moves.keys()]
-            self._weights = jnp.array([weight for weight in moves.values()]) / len(
-                moves
-            )
+            self._moves = list(moves.keys())
+            self._weights = jnp.array([weight for weight in moves.values()]) / len(moves)
 
         super().__init__(model, potential_fn, randomize_split, init_strategy)
 
-    # TODO: this doesn't show because state_method='vectorized' shuts off diagnostics_str
+    # XXX: this doesn't show because state_method='vectorized' shuts off diagnostics_str
     def get_diagnostics_str(self, state):
         return "acc. prob={:.2f}".format(state.inner_state.mean_accept_prob)
 
     def init_inner_state(self, rng_key):
-        # TODO: allow kwargs for moves
-        self._moves = [
-            move(self._num_chains) if move is AIES.make_de else move
-            for move in self._moves
-        ]
+        # XXX hack -- we don't know num_chains until we init the inner state
+        self._moves = [move(self._num_chains) if move.__name__ == 'make_de_move'
+                       else move for move in self._moves]
 
         return AIESState(jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), rng_key)
 
@@ -299,9 +235,83 @@ class AIES(EnsembleSampler):
             itr, accept_prob, mean_accept_prob, rng_key
         )
 
+    @staticmethod
+    def DEMove(sigma=1.0e-5, g0=None):
+        """A proposal using differential evolution.
+        
+        This `Differential evolution proposal
+        <http://www.stat.columbia.edu/~gelman/stuff_for_blog/cajo.pdf>`_ is
+        implemented following `Nelson et al. (2013)
+        <https://doi.org/10.1088/0067-0049/210/1/11>`_.
+        Args:
+            sigma (float): The standard deviation of the Gaussian used to stretch
+                the proposal vector.
+            gamma0 (Optional[float]): The mean stretch factor for the proposal
+                vector. By default, it is `2.38 / sqrt(2*ndim)`
+                as recommended by the two references.
+        """
+        def make_de_move(n_chains):
+            PAIRS = _get_nondiagonal_pairs(n_chains // 2)
 
-# ensemble slice sampler
+            def de_move(rng_key, active, inactive):                
+                pairs_key, gamma_key = random.split(rng_key)
+                n_active_chains, n_params = inactive.shape
+
+                # TODO: if we pass in n_params to parent scope we don't need to recompute this each time
+                g = 2.38 / jnp.sqrt(2.0 * n_params) if not g0 else g0
+
+                selected_pairs = random.choice(pairs_key, PAIRS, shape=(n_active_chains,))
+
+                # Compute diff vectors
+                diffs = jnp.diff(inactive[selected_pairs], axis=1).squeeze(axis=1)
+
+                # Sample a gamma value for each walker following Nelson et al. (2013)
+                gamma = dist.Normal(g, g * sigma).sample(
+                    gamma_key, sample_shape=(n_active_chains, 1)
+                )
+
+                # In this way, sigma is the standard deviation of the distribution of gamma,
+                # instead of the standard deviation of the distribution of the proposal as proposed by Ter Braak (2006).
+                # Otherwise, sigma should be tuned for each dimension, which confronts the idea of affine-invariance.
+                proposal = active + gamma * diffs
+
+                return proposal, jnp.zeros(n_active_chains)
+
+            return de_move
+        
+        return make_de_move
+
+    @staticmethod
+    def StretchMove(a=2.0):
+        """
+        A `Goodman & Weare (2010)
+        <https://msp.org/camcos/2010/5-1/p04.xhtml>`_ "stretch move" with
+        parallelization as described in `Foreman-Mackey et al. (2013)
+        <https://arxiv.org/abs/1202.3665>`_.
+
+        :param a: (optional)
+            The stretch scale parameter. (default: ``2.0``)
+        """
+        def stretch_move(rng_key, active, inactive):
+            n_active_chains, n_params = active.shape
+            unif_key, idx_key = random.split(rng_key)
+
+            zz = (
+                (a - 1.0) * random.uniform(unif_key, shape=(n_active_chains,)) + 1
+            ) ** 2.0 / a
+            factors = (n_params - 1.0) * jnp.log(zz)
+            r_idxs = random.randint(
+                idx_key, shape=(n_active_chains,), minval=0, maxval=n_active_chains
+            )
+
+            proposal = inactive[r_idxs] - (inactive[r_idxs] - active) * zz[:, jnp.newaxis]
+
+            return proposal, factors
+        
+        return stretch_move
+
 class ESS(EnsembleSampler):
+    """Ensemble Slice Sampling as implemented in zeus-mcmc"""
     def __init__(
         self,
         model=None,
@@ -323,19 +333,21 @@ class ESS(EnsembleSampler):
     def init_inner_state(self, rng_key):
         self.batch_log_density = lambda x: self._batch_log_density(x)[:, jnp.newaxis]
 
-        # self.move = ESS.make_differential_move(self._num_chains)
+        self.move = ESS.make_differential_move(self._num_chains)
 
-        return ESSState(self._init_mu, rng_key)
+        return ESSState(jnp.array(0.0), jnp.array(0), jnp.array(0), self._init_mu, rng_key)
 
     def update_active_chains(self, active, inactive, inner_state):
-        mu, rng_key = inner_state
+        i, n_expansions, n_contractions, mu, rng_key = inner_state
         rng_key, dir_key, height_key, step_out_key, shrink_key = random.split(
             rng_key, 5
         )
         n_active_chains, n_params = active.shape
 
-        directions = ESS.RandomMove(dir_key, inactive, mu)
-        # directions = self.move(dir_key, inactive, mu) #ESS.DifferentialMove(dir_key, inactive, mu)
+        directions = self.move(dir_key, inactive, mu)
+        #ESS.DifferentialMove(dir_key, inactive, mu)
+        #ESS.GaussianMove(dir_key, inactive, mu) # ESS.RandomMove(dir_key, inactive, mu)
+        #directions = self.move(dir_key, inactive, mu) 
         # ESS.KDEMove(dir_key, inactive, mu)
         ##
 
@@ -343,21 +355,32 @@ class ESS(EnsembleSampler):
             height_key, sample_shape=(n_active_chains, 1)
         )
 
-        n_expansions, L, R = self._step_out(
+        curr_n_expansions, L, R = self._step_out(
             step_out_key, log_slice_height, active, directions
         )
-        proposal, n_contractions = self._shrink(
+        proposal, curr_n_contractions = self._shrink(
             shrink_key, log_slice_height, L, R, active, directions
         )
 
-        # TODO: this should be computed from the sum of both chain sets
+        n_expansions += curr_n_expansions
+        n_contractions += curr_n_contractions
+        itr = i + 0.5
+        
         if self._tune_mu:
-            n_expansions = jnp.max(
-                jnp.array([1, n_expansions])
-            )  # This is to prevent the optimizer from getting stuck
-            mu = 2.0 * n_expansions / (n_expansions + n_contractions)
+            # TODO: this could probably be a lax.cond
 
-        return proposal, ESSState(mu, rng_key)
+            safe_n_expansions = jnp.max(jnp.array([1, n_expansions])) 
+
+            # only update if a full iteration has passed
+            mu = jnp.where(jnp.all(itr % 1 == 0),
+                           2.0 * safe_n_expansions / (safe_n_expansions + n_contractions),
+                           mu)
+
+        
+        n_expansions, n_contractions, tune_ready = 0, 0, 0 
+            
+        return proposal, ESSState(itr, n_expansions, n_contractions, mu, rng_key)
+
 
     @staticmethod
     def RandomMove(rng_key, inactive, mu):
@@ -395,7 +418,6 @@ class ESS(EnsembleSampler):
 
         return _KDEMove
 
-    # TODO: this move needs burn-in first before it can be used
     @staticmethod
     def GaussianMove(rng_key, inactive, mu):
         """
@@ -453,12 +475,11 @@ class ESS(EnsembleSampler):
             )
         )
         K = (self._max_steps - 1) - J
-        mask_J = jnp.full(
-            (n_active_chains, 1), True
-        )  # left stepping-out initialisation
-        mask_K = jnp.full(
-            (n_active_chains, 1), True
-        )  # right stepping-out initialisation
+        
+        # left stepping-out initialisation
+        mask_J = jnp.full((n_active_chains, 1), True)
+        # right stepping-out initialisation  
+        mask_K = jnp.full((n_active_chains, 1), True)  
 
         init_values = (n_expansions, L, R, J, K, mask_J, mask_K, iteration)
 
@@ -507,9 +528,7 @@ class ESS(EnsembleSampler):
         n_contractions = 0
         widths = jnp.zeros((n_active_chains, 1))
         proposed = jnp.zeros((n_active_chains, n_params))
-        can_shrink = jnp.full(
-            (n_active_chains, 1), True
-        )  # this should be called can_shrink
+        can_shrink = jnp.full((n_active_chains, 1), True)
 
         init_values = (
             rng_key,
