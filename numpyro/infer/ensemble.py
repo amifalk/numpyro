@@ -57,6 +57,10 @@ This consists of the following fields:
 
 
 class EnsembleSampler(MCMCKernel, ABC):
+    """
+    Abstract class for ensemble samplers.
+    """
+    
     def __init__(self, model=None, potential_fn=None, randomize_split=False, init_strategy=init_to_uniform):
         if not (model is None) ^ (potential_fn is None):
             raise ValueError("Only one of `model` or `potential_fn` must be specified.")
@@ -95,12 +99,7 @@ class EnsembleSampler(MCMCKernel, ABC):
 
     def _init_state(self, rng_key, model_args, model_kwargs, init_params):
         if self._model is not None:
-            (
-                new_params_info,
-                potential_fn_gen,
-                self._postprocess_fn,
-                _,
-            ) = initialize_model(
+            new_params_info, potential_fn_gen, self._postprocess_fn, _ = initialize_model(
                 rng_key,
                 self._model,
                 dynamic_args=True,
@@ -170,21 +169,33 @@ class EnsembleSampler(MCMCKernel, ABC):
             active = z_flat[active_start_idx[split] : active_stop_idx[split]]
             inactive = z_flat[inactive_start_idx[split] : inactive_stop_idx[split]]
 
-            z_updates, inner_state = self.update_active_chains(
-                active, inactive, inner_state
-            )
+            z_updates, inner_state = self.update_active_chains(active, inactive, inner_state)
 
-            z_flat = z_flat.at[active_start_idx[split] : active_stop_idx[split]].set(
-                z_updates
-            )
+            z_flat = z_flat.at[active_start_idx[split] : active_stop_idx[split]].set(z_updates)
 
         return EnsembleSamplerState(unravel_fn(z_flat), inner_state, rng_key)
 
 
 class AIES(EnsembleSampler):
-    """Affine-Invariant Ensemble Sampling as implemented in emcee"""
+    """
+    Affine-Invariant Ensemble Sampling: a gradient free method.
     
-    def __init__( self, model=None, potential_fn=None, randomize_split=False, init_strategy=init_to_uniform, moves=None):
+    **References:**
+    
+    1. *emcee: The MCMC Hammer* (https://iopscience.iop.org/article/10.1086/670067),
+        Daniel Foreman-Mackey, David W. Hogg, Dustin Lang, and Jonathan Goodman. 
+    
+    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
+        If model is provided, `potential_fn` will be inferred using the model.
+    :param potential_fn: TODO <currently not supported>
+    :param bool randomize_split: whether or not to permute the chain order at each iteration.
+    :param moves: a dictionary mapping moves to their respective probabilities of being selected.
+        If left empty, defaults to `AIES.DEMove()`. 
+    :param callable init_strategy: a per-site initialization function.
+        See :ref:`init_strategy` section for available functions.
+    """
+    
+    def __init__(self, model=None, potential_fn=None, randomize_split=False, moves=None, init_strategy=init_to_uniform):
         if not moves:
             self._moves = [AIES.DEMove()]
             self._weights = jnp.array([1.0])
@@ -309,20 +320,52 @@ class AIES(EnsembleSampler):
             return proposal, factors
         
         return stretch_move
+    
 
 class ESS(EnsembleSampler):
-    """Ensemble Slice Sampling as implemented in zeus-mcmc"""
+    """
+    Ensemble Slice Sampling: a gradient free method.
+    
+    **References:**
+    
+    1. *zeus: a PYTHON implementation of ensemble slice sampling for efficient Bayesian parameter inference* (https://academic.oup.com/mnras/article/508/3/3589/6381726),
+        Minas Karamanis, Florian Beutler, and John A. Peacock.
+    2. *Ensemble slice sampling* (https://link.springer.com/article/10.1007/s11222-021-10038-2),
+        Minas Karamanis, Florian Beutler.
+        
+    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
+        If model is provided, `potential_fn` will be inferred using the model.
+    :param potential_fn: TODO <currently not supported>
+    :param bool randomize_split: whether or not to permute the chain order at each iteration. 
+        Strongly recommended to set to True.
+    :param moves: a dictionary mapping moves to their respective probabilities of being selected.
+        If left empty, defaults to `ESS.DifferentialMove()`.
+    :param int max_steps: number of maximum stepping-out steps per sample.
+    :param int max_iter: number of maximum expansions/contractions per sample.
+    :param float init_mu: initial scale factor.
+    :param bool tune_mu: whether or not to tune the intial scale factor.
+    :param callable init_strategy: a per-site initialization function.
+        See :ref:`init_strategy` section for available functions.
+    """
     def __init__(
         self,
         model=None,
         potential_fn=None,
         randomize_split=True,
+        moves=None,
         max_steps=10_000,
         max_iter=10_000,
         init_mu=1.0,
         tune_mu=True,
         init_strategy=init_to_uniform,
     ):
+        if not moves:
+            self._moves = [ESS.DifferentialMove()]
+            self._weights = jnp.array([1.0])
+        else:
+            self._moves = list(moves.keys())
+            self._weights = jnp.array([weight for weight in moves.values()]) / len(moves)
+        
         self._max_steps = max_steps  # max number of stepping out steps
         self._max_iter = max_iter  # max number of expansions/contractions
         self._init_mu = init_mu
@@ -333,23 +376,25 @@ class ESS(EnsembleSampler):
     def init_inner_state(self, rng_key):
         self.batch_log_density = lambda x: self._batch_log_density(x)[:, jnp.newaxis]
 
-        self.move = ESS.make_differential_move(self._num_chains)
+        # XXX hack -- we don't know num_chains until we init the inner state
+        self._moves = [move(self._num_chains) if move.__name__ == 'make_differential_move'
+                       else move for move in self._moves]
 
         return ESSState(jnp.array(0.0), jnp.array(0), jnp.array(0), self._init_mu, rng_key)
 
     def update_active_chains(self, active, inactive, inner_state):
         i, n_expansions, n_contractions, mu, rng_key = inner_state
-        rng_key, dir_key, height_key, step_out_key, shrink_key = random.split(
-            rng_key, 5
-        )
+        (rng_key,
+         move_key,
+         dir_key,
+         height_key,
+         step_out_key,
+         shrink_key) = random.split(rng_key, 6)
+
         n_active_chains, n_params = active.shape
 
-        directions = self.move(dir_key, inactive, mu)
-        #ESS.DifferentialMove(dir_key, inactive, mu)
-        #ESS.GaussianMove(dir_key, inactive, mu) # ESS.RandomMove(dir_key, inactive, mu)
-        #directions = self.move(dir_key, inactive, mu) 
-        # ESS.KDEMove(dir_key, inactive, mu)
-        ##
+        move_i = random.choice(move_key, len(self._moves), p=self._weights)
+        directions = jax.lax.switch(move_i, self._moves, dir_key, inactive, mu)
 
         log_slice_height = self.batch_log_density(active) - dist.Exponential().sample(
             height_key, sample_shape=(n_active_chains, 1)
@@ -375,38 +420,39 @@ class ESS(EnsembleSampler):
             mu = jnp.where(jnp.all(itr % 1 == 0),
                            2.0 * safe_n_expansions / (safe_n_expansions + n_contractions),
                            mu)
-
         
-        n_expansions, n_contractions, tune_ready = 0, 0, 0 
+        # TODO: this is wrong, should only set to zero after a full iteration
+        n_expansions, n_contractions = 0, 0  
             
         return proposal, ESSState(itr, n_expansions, n_contractions, mu, rng_key)
 
 
     @staticmethod
-    def RandomMove(rng_key, inactive, mu):
+    def RandomMove():
         """
         The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Random Move" with parallelization.
         When this move is used the walkers move along random directions. There is no communication between the
         walkers and this Move corresponds to the vanilla Slice Sampling method. This Move should be used for
         debugging purposes only.
         """
-        directions = dist.Normal(loc=0, scale=1).sample(
-            rng_key, sample_shape=inactive.shape
-        )
-        directions /= jnp.linalg.norm(directions, axis=0)
+        def random_move(rng_key, inactive, mu):
+            directions = dist.Normal(loc=0, scale=1).sample(
+                rng_key, sample_shape=inactive.shape
+            )
+            directions /= jnp.linalg.norm(directions, axis=0)
 
-        return 2.0 * mu * directions
+            return 2.0 * mu * directions
+        return random_move
 
-    # TODO: this move needs burn-in first before it can be used
     @staticmethod
     def KDEMove(bw_method=None):
-        def _KDEMove(rng_key, inactive, mu):
-            """
-            The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "KDE Move" with parallelization.
-            When this Move is used the distribution of the walkers of the complementary ensemble is traced using
-            a Gaussian Kernel Density Estimation methods. The walkers then move along random direction vectos
-            sampled from this distribution.
-            """
+        """
+        The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "KDE Move" with parallelization.
+        When this Move is used the distribution of the walkers of the complementary ensemble is traced using
+        a Gaussian Kernel Density Estimation methods. The walkers then move along random direction vectos
+        sampled from this distribution.
+        """
+        def kde_move(rng_key, inactive, mu):
             n_active_chains, n_params = inactive.shape
 
             kde = gaussian_kde(inactive.T, bw_method=bw_method)
@@ -415,48 +461,52 @@ class ESS(EnsembleSampler):
             directions = vectors[:n_active_chains] - vectors[n_active_chains:]
 
             return 2.0 * mu * directions
-
-        return _KDEMove
+        return kde_move
 
     @staticmethod
-    def GaussianMove(rng_key, inactive, mu):
+    def GaussianMove():
         """
         The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Gaussian Move" with parallelization.
         When this Move is used the walkers move along directions defined by random vectors sampled from the Gaussian
         approximation of the walkers of the complementary ensemble.
         """
-        n_active_chains, n_params = inactive.shape
-        cov = jnp.cov(inactive, rowvar=False)
+        def gaussian_move(rng_key, inactive, mu):
+            n_active_chains, n_params = inactive.shape
+            cov = jnp.cov(inactive, rowvar=False)
 
-        return (
-            2.0
-            * mu
-            * dist.MultivariateNormal(0, cov).sample(
-                rng_key, sample_shape=(n_active_chains,)
+            return (
+                2.0
+                * mu
+                * dist.MultivariateNormal(0, cov).sample(
+                    rng_key, sample_shape=(n_active_chains,)
+                )
             )
-        )
+        return gaussian_move
 
     @staticmethod
-    def make_differential_move(n_chains):
-        PAIRS = _get_nondiagonal_pairs(n_chains // 2)
+    def DifferentialMove():
+        """
+        The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Differential Move" with parallelization.
+        When this Move is used the walkers move along directions defined by random pairs of walkers sampled (with no
+        replacement) from the complementary ensemble. This is the default choice and performs well along a wide range
+        of target distributions.
+        """
+        def make_differential_move(n_chains):
+            PAIRS = _get_nondiagonal_pairs(n_chains // 2)
+            
+            def differential_move(rng_key, inactive, mu):
+                n_active_chains, n_params = inactive.shape
 
-        def DifferentialMove(rng_key, inactive, mu):
-            """
-            The `Karamanis & Beutler (2020) <https://arxiv.org/abs/2002.06212>`_ "Differential Move" with parallelization.
-            When this Move is used the walkers move along directions defined by random pairs of walkers sampled (with no
-            replacement) from the complementary ensemble. This is the default choice and performs well along a wide range
-            of target distributions.
-            """
-            n_active_chains, n_params = inactive.shape
+                selected_pairs = random.choice(rng_key, PAIRS, shape=(n_active_chains,))
+                diffs = jnp.diff(inactive[selected_pairs], axis=1).squeeze(
+                    axis=1
+                )  # get the pairwise difference of each vector
 
-            selected_pairs = random.choice(rng_key, PAIRS, shape=(n_active_chains,))
-            diffs = jnp.diff(inactive[selected_pairs], axis=1).squeeze(
-                axis=1
-            )  # get the pairwise difference of each vector
+                return 2.0 * mu * diffs
+            return differential_move
+        
+        return make_differential_move
 
-            return 2.0 * mu * diffs
-
-        return DifferentialMove
 
     def _step_out(self, rng_key, log_slice_height, active, directions):
         init_L_key, init_J_key = random.split(rng_key)
