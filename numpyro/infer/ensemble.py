@@ -8,7 +8,7 @@ from jax.scipy.stats import gaussian_kde
 
 import numpyro.distributions as dist
 from numpyro.infer.ensemble_util import _get_nondiagonal_pairs, batch_ravel_pytree
-from numpyro.infer.initialization import init_to_sample, init_to_uniform
+from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import initialize_model
 from numpyro.util import identity, is_prng_key
@@ -29,7 +29,7 @@ AIESState = namedtuple("AIESState", ["i", "accept_prob", "mean_accept_prob", "rn
 """
 A :func:`~collections.namedtuple` consisting of the following fields.
 
- - **i** - iteration. This is reset to 0 after warmup.
+ - **i** - iteration.
  - **accept_prob** - Acceptance probability of the proposal. Note that ``z``
    does not correspond to the proposal if it is rejected.
  - **mean_accept_prob** - Mean acceptance probability until current iteration
@@ -48,9 +48,9 @@ ESSState = namedtuple("ESSState", ["i",
 A :func:`~collections.namedtuple` used as an inner state for Ensemble Sampler.
 This consists of the following fields:
 
- - **i** - iteration. This is reset to 0 after warmup.
- - **n_expansions** - number of expansions in the last two batches. Used for tuning mu.
- - **n_contractions** - number of contractions in the last two batches. Used for tuning mu.
+ - **i** - iteration.
+ - **n_expansions** - number of expansions in the current batch. Used for tuning mu.
+ - **n_contractions** - number of contractions in the current batch. Used for tuning mu.
  - **mu** - Scale factor. This is tuned if tune_mu=True.
  - **rng_key** - random number generator seed used for generating proposals, etc.
 """
@@ -59,6 +59,13 @@ This consists of the following fields:
 class EnsembleSampler(MCMCKernel, ABC):
     """
     Abstract class for ensemble samplers.
+    
+    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
+        If model is provided, `potential_fn` will be inferred using the model.
+    :param potential_fn: XXX currently unsupported.
+    :param bool randomize_split: whether or not to permute the chain order at each iteration.
+    :param callable init_strategy: a per-site initialization function.
+        See :ref:`init_strategy` section for available functions.
     """
     
     def __init__(self, model=None, potential_fn=None, randomize_split=False, init_strategy=init_to_uniform):
@@ -165,6 +172,8 @@ class EnsembleSampler(MCMCKernel, ABC):
         if self._randomize_split:
             z_flat = random.permutation(rng_key, z_flat, axis=0)
 
+        # TODO: is there a way to do this without having to compile twice?
+        # indexing depends on the iteration which makes scan/foriloop tricky
         for split in range(2):
             active = z_flat[active_start_idx[split] : active_stop_idx[split]]
             inactive = z_flat[inactive_start_idx[split] : inactive_stop_idx[split]]
@@ -178,7 +187,11 @@ class EnsembleSampler(MCMCKernel, ABC):
 
 class AIES(EnsembleSampler):
     """
-    Affine-Invariant Ensemble Sampling: a gradient free method.
+    Affine-Invariant Ensemble Sampling: a gradient free method. Suitable for low to moderate dimensional models.
+    Generally, `num_chains` should be at least twice the dimensionality of the model.
+    
+    .. note:: This kernel must be used with `num_chains` > 1 and `chain_method="vectorized`
+        or `chain_method="parallel` in :class:`MCMC`. The number of chains must be divisible by 2.
     
     **References:**
     
@@ -187,12 +200,31 @@ class AIES(EnsembleSampler):
     
     :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
         If model is provided, `potential_fn` will be inferred using the model.
-    :param potential_fn: TODO <currently not supported>
+    :param potential_fn: XXX currently unsupported.
     :param bool randomize_split: whether or not to permute the chain order at each iteration.
     :param moves: a dictionary mapping moves to their respective probabilities of being selected.
         If left empty, defaults to `AIES.DEMove()`. 
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
+        
+    **Example**
+
+    .. code-block:: python
+        import jax
+        import jax.numpy as jnp
+        import numpyro
+        import numpyro.distributions as dist
+        from numpyro.infer import MCMC, AIES
+
+        def model():
+            x = numpyro.sample("x", dist.Normal().expand([10]))
+            numpyro.sample("obs", dist.Normal(x, 1.0), obs=jnp.ones(10))
+        
+        kernel = AIES(model, moves={AIES.DEMove() : .5, 
+                                    AIES.StretchMove() : .5})
+        mcmc = MCMC(kernel, num_warmup=1000, num_samples=2000, num_chains=20, chain_method='vectorized')
+        mcmc.run(jax.random.PRNGKey(0))
+        mcmc.print_summary()
     """
     
     def __init__(self, model=None, potential_fn=None, randomize_split=False, moves=None, init_strategy=init_to_uniform):
@@ -324,7 +356,11 @@ class AIES(EnsembleSampler):
 
 class ESS(EnsembleSampler):
     """
-    Ensemble Slice Sampling: a gradient free method.
+    Ensemble Slice Sampling: a gradient free method. Suitable for low to moderate dimensional models.
+    Generally, `num_chains` should be at least twice the dimensionality of the model.
+    
+    .. note:: This kernel must be used with `num_chains` > 1 and `chain_method="vectorized`
+        or `chain_method="parallel` in :class:`MCMC`. The number of chains must be divisible by 2.
     
     **References:**
     
@@ -335,7 +371,7 @@ class ESS(EnsembleSampler):
         
     :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
         If model is provided, `potential_fn` will be inferred using the model.
-    :param potential_fn: TODO <currently not supported>
+    :param potential_fn: XXX currently unsupported.
     :param bool randomize_split: whether or not to permute the chain order at each iteration. 
         Strongly recommended to set to True.
     :param moves: a dictionary mapping moves to their respective probabilities of being selected.
@@ -346,6 +382,25 @@ class ESS(EnsembleSampler):
     :param bool tune_mu: whether or not to tune the intial scale factor.
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
+        
+    **Example**
+    
+    .. code-block:: python
+        import jax
+        import jax.numpy as jnp
+        import numpyro
+        import numpyro.distributions as dist
+        from numpyro.infer import MCMC, AIES
+
+        def model():
+            x = numpyro.sample("x", dist.Normal().expand([10]))
+            numpyro.sample("obs", dist.Normal(x, 1.0), obs=jnp.ones(10))
+        
+        kernel = AIES(model, moves={ESS.DifferentialMove() : .8, 
+                                    ESS.KDEMove() : .2})
+        mcmc = MCMC(kernel, num_warmup=1000, num_samples=2000, num_chains=20, chain_method='vectorized')
+        mcmc.run(jax.random.PRNGKey(0))
+        mcmc.print_summary()
     """
     def __init__(
         self,
@@ -412,18 +467,20 @@ class ESS(EnsembleSampler):
         itr = i + 0.5
         
         if self._tune_mu:
-            # TODO: this could probably be a lax.cond
-
             safe_n_expansions = jnp.max(jnp.array([1, n_expansions])) 
 
-            # only update if a full iteration has passed
-            mu = jnp.where(jnp.all(itr % 1 == 0),
-                           2.0 * safe_n_expansions / (safe_n_expansions + n_contractions),
-                           mu)
-        
-        # TODO: this is wrong, should only set to zero after a full iteration
-        n_expansions, n_contractions = 0, 0  
-            
+            # only update tuning scale if a full iteration has passed
+            mu, n_expansions, n_contractions = jax.lax.cond(jnp.all(itr % 1 == 0), 
+                                                            lambda n_exp, n_con: (2.0 * n_exp / (n_exp + n_con), 
+                                                                                  jnp.array(0),
+                                                                                  jnp.array(0)
+                                                                                  ),  
+                                                            lambda _, __: (mu, 
+                                                                           n_expansions,
+                                                                           n_contractions
+                                                                           ),
+                                                            safe_n_expansions, n_contractions)
+   
         return proposal, ESSState(itr, n_expansions, n_contractions, mu, rng_key)
 
 
@@ -543,9 +600,7 @@ class ESS(EnsembleSampler):
         def body_fn(args):
             n_expansions, L, R, J, K, mask_J, mask_K, iteration = args
 
-            log_prob_L = self.batch_log_density(
-                directions * L + active
-            )  # TODO: could make this into one if I wanted to
+            log_prob_L = self.batch_log_density(directions * L + active)  
             log_prob_R = self.batch_log_density(directions * R + active)
 
             can_expand_L = log_prob_L > log_slice_height
